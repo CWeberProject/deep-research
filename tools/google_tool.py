@@ -14,19 +14,21 @@ class GoogleSearchError(Exception):
     """Exception raised when Google search fails."""
     pass
 
-@function_tool
-async def google_search(query: str, num_results: int = 10, max_retries: int = 3) -> list:
+@function_tool(name_override="google")
+async def google_search(query: str) -> str:
     """
     Perform a Google search using Playwright and return the top search result URLs.
 
     Args:
         query: The search query string.
-        num_results: Number of results to return (default: 10).
-        max_retries: Maximum number of retry attempts (default: 3).
 
     Returns:
-        A list of URLs from the search results.
+        A string representation of the search result URLs, one URL per line.
     """
+    # Set default values internally
+    num_results = 10
+    max_retries = 3
+    
     # Encode the query for URL
     encoded_query = urllib.parse.quote_plus(query)
     
@@ -92,84 +94,105 @@ async def google_search(query: str, num_results: int = 10, max_retries: int = 3)
                     await browser.close()
                     continue
                 
-                # Wait for search results with multiple selector options
-                result_selectors = ["div#search", "div#rso", "div.g"]
-                
-                for selector in result_selectors:
-                    try:
-                        await page.wait_for_selector(selector, timeout=5000)
-                        logger.info(f"Found results with selector: {selector}")
-                        break
-                    except TimeoutError:
-                        logger.info(f"Selector {selector} not found, trying next...")
-                        continue
-                else:
-                    # If we get here, none of the selectors worked
-                    logger.warning("Could not find any search results with known selectors")
-                    screenshot_path = f"failed_search_{int(time.time())}.png"
-                    await page.screenshot(path=screenshot_path)
-                    logger.info(f"Saved screenshot to {screenshot_path}")
-                    await browser.close()
-                    continue
-                
+                # Wait for search results
+                await page.wait_for_selector("div#search", timeout=10000)
                 await human_like_delay(1000, 2000)
                 
-                # Try multiple selector strategies to get links
-                links = []
-                
-                # List of selector strategies to try
-                selector_strategies = [
-                    "div.g div.yuRUbf > a, div.IsZvec > div > span > a",
-                    "div.g a[href^='http']:not([href*='google.com'])",
-                    "div#search a[href^='http']:not([href*='google.com'])",
-                    "div#rso a[href^='http']:not([href*='google.com'])",
-                    "div.g h3:has(+ a[href])",
-                    "a[ping]"
+                # Target the main Google search result links specifically
+                main_result_selectors = [
+                    "a.zReHs[jsname='UWckNb']",  # Specific class based on your example
+                    "div.g div.yuRUbf > a",      # Common structure for main results
+                    "//a[contains(@class, 'zReHs') and @jsname='UWckNb']",  # XPath alternative
+                    "div[jscontroller] > div > div > div > div > a[data-ved]",  # Structure-based
+                    "h3.LC20lb + div + span > a", # Targeting links near headings
+                    "h3.LC20lb"                   # Find headings and get their parent links
                 ]
                 
-                for selector in selector_strategies:
+                links = []
+                
+                # Try each selector strategy to extract the main result links
+                for selector in main_result_selectors:
                     try:
-                        links = await page.eval_on_selector_all(
-                            selector,
-                            """(elements) => {
-                                return Array.from(elements)
-                                    .map(a => a.href || (a.closest('a') ? a.closest('a').href : null))
-                                    .filter(href => 
-                                        href && 
-                                        href.startsWith('http') && 
-                                        !href.includes('google.com/')
-                                    );
-                            }"""
-                        )
+                        if selector.startswith("//"):  # Handle XPath selectors
+                            elements = await page.locator(selector).all()
+                            extracted_links = []
+                            for el in elements:
+                                href = await el.get_attribute("href")
+                                if href and href.startswith("http") and "google.com/" not in href:
+                                    extracted_links.append(href)
+                        elif selector == "h3.LC20lb":  # Special handling for headings
+                            extracted_links = await page.evaluate("""() => {
+                                const headings = Array.from(document.querySelectorAll('h3.LC20lb'));
+                                return headings
+                                    .map(h => {
+                                        const link = h.closest('a') || 
+                                                    h.parentElement.closest('a') ||
+                                                    h.parentElement.parentElement.querySelector('a');
+                                        return link ? link.href : null;
+                                    })
+                                    .filter(href => href && href.startsWith('http') && !href.includes('google.com/'));
+                            }""")
+                        else:  # Regular CSS selectors
+                            extracted_links = await page.eval_on_selector_all(
+                                selector,
+                                """(elements) => {
+                                    return Array.from(elements)
+                                        .map(a => a.href)
+                                        .filter(href => 
+                                            href && 
+                                            href.startsWith('http') && 
+                                            !href.includes('google.com/')
+                                        );
+                                }"""
+                            )
                         
-                        if links and len(links) > 0:
-                            logger.info(f"Found {len(links)} links using selector: {selector}")
-                            break
+                        if extracted_links and len(extracted_links) > 0:
+                            logger.info(f"Found {len(extracted_links)} main result links using selector: {selector}")
+                            links.extend(extracted_links)
+                            if len(links) >= num_results:
+                                break
                     except Exception as e:
                         logger.info(f"Selector {selector} failed: {str(e)}")
                         continue
                 
-                # If we still couldn't find links, try one more approach - extract from the page content
+                # If standard selectors fail, try a more targeted approach with the exact structure
                 if not links:
-                    logger.info("Using JavaScript to extract all links from page")
-                    links = await page.evaluate("""() => {
-                        const allLinks = Array.from(document.querySelectorAll('a[href]'));
-                        return allLinks
-                            .map(a => a.href)
-                            .filter(href => 
-                                href && 
-                                href.startsWith('http') && 
-                                !href.includes('google.com/')
-                            );
-                    }""")
+                    logger.info("Attempting to extract main results using the exact structure")
+                    try:
+                        links = await page.evaluate("""() => {
+                            const mainLinks = Array.from(document.querySelectorAll('a[jsname="UWckNb"][class="zReHs"]'));
+                            if (mainLinks.length === 0) {
+                                const headings = Array.from(document.querySelectorAll('h3.LC20lb'));
+                                return headings
+                                    .map(h => {
+                                        const link = h.closest('a') || h.parentElement.closest('a');
+                                        return link ? link.href : null;
+                                    })
+                                    .filter(href => href && href.startsWith('http') && !href.includes('google.com/'));
+                            }
+                            return mainLinks
+                                .map(a => a.href)
+                                .filter(href => href && href.startsWith('http') && !href.includes('google.com/'));
+                        }""")
+                    except Exception as e:
+                        logger.error(f"Error extracting main links with exact structure: {str(e)}")
                 
                 await browser.close()
                 
-                if links and len(links) > 0:
-                    # Return only the requested number of results
-                    return links[:num_results]
+                # Remove duplicates while preserving order
+                unique_links = []
+                seen = set()
+                for link in links:
+                    if link not in seen:
+                        seen.add(link)
+                        unique_links.append(link)
+                
+                if unique_links and len(unique_links) > 0:
+                    # Convert list of links to a string with one URL per line
+                    result_links = unique_links[:num_results]
+                    return '\n'.join(result_links)
                 else:
-                    logger.warning("No links found in search results")
+                    logger.warning("No main result links found in search results")
                     continue
                 
         except Exception as e:
@@ -177,23 +200,20 @@ async def google_search(query: str, num_results: int = 10, max_retries: int = 3)
             if attempts >= max_retries:
                 raise GoogleSearchError(f"Failed to perform Google search after {max_retries} attempts: {str(e)}")
 
-    # If we get here, all retries failed
     raise GoogleSearchError(f"Failed to perform Google search after {max_retries} attempts")
 
-async def human_like_delay(min_ms=200, max_ms=800):
+def human_like_delay(min_ms=200, max_ms=800):
     """Add a random delay to simulate human interaction"""
     delay = random.randint(min_ms, max_ms) / 1000.0
-    await asyncio.sleep(delay)
+    asyncio.sleep(delay)
 
-async def is_captcha_page(page):
+def is_captcha_page(page):
     """Check if the current page is a Google CAPTCHA challenge"""
     try:
-        # Check URL first
         current_url = page.url
         if "sorry" in current_url or "captcha" in current_url:
             return True
         
-        # Check for common CAPTCHA elements
         captcha_indicators = [
             "body:has-text('unusual traffic')",
             "body:has-text('please try again')",
@@ -204,10 +224,30 @@ async def is_captcha_page(page):
         ]
         
         for indicator in captcha_indicators:
-            if await page.locator(indicator).count() > 0:
+            if page.locator(indicator).count() > 0:
                 return True
                 
         return False
     except Exception:
-        # If any error occurs during check, assume it might be a CAPTCHA to be safe
         return False
+
+# Add a __main__ section for testing
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Run a Google search from the command line")
+    parser.add_argument("query", help="The search query to run")
+    args = parser.parse_args()
+    
+    async def run_search():
+        try:
+            results = await google_search(args.query)
+            print("\nSearch Results:")
+            print("---------------")
+            print(results)
+            print("\nTotal results found:", len(results.split('\n')))
+        except GoogleSearchError as e:
+            print(f"Error: {e}")
+    
+    # Run the async function
+    asyncio.run(run_search())

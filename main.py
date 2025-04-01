@@ -1,7 +1,11 @@
 import sys
 import asyncio
 from agents_list.enhancer_agent import enhancer_agent
+from agents_list.brain_agent import brain_agent
+
 from agents import Runner
+
+content_list = []
 
 
 async def run_enhancer():
@@ -42,6 +46,12 @@ async def run_enhancer():
         print("\n=== Enhanced Research Directive ===\n")
         print(enhanced_query.final_output)
         print("\n===================================\n")
+
+        # Run the brain agent with the enhanced query
+        final_report = await Runner.run(brain_agent, enhanced_query.final_output)
+        print("\n=== Final Report ===\n")
+        print(final_report.final_output)
+        print("\n====================\n")
         
     except Exception as e:
         print(f"\nAn error occurred: {e}")
